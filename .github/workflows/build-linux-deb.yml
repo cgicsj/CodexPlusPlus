@@ -105,7 +105,11 @@ jobs:
           grep -A1 '^Depends:' "$LIB" | sed -n '2p' | grep -q '^Recommends:' \
             || { echo "control 的 Depends 后面不是 Recommends（补丁未生效或上游已改结构）" >&2; exit 1; }
           # shellcheck disable=SC1090
+          # 注意：被 source 的上游脚本顶部有 VERSION="${1:-1.3.0}"，
+          # 会把 env 传进来的版本号覆盖成写死的 1.3.0。所以先把它存下来。
+          PKG_VERSION="$VERSION"
           source "$LIB"
+          VERSION="$PKG_VERSION"
           build_rust
           package_deb
 
@@ -114,8 +118,14 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          DEB="dist/linux/codex-plus-plus_${VERSION}_$(dpkg --print-architecture).deb"
-          ls -lh "$DEB"
+          ls -la dist/linux/
+          # 不靠拼文件名，直接取实际产物，避免版本号/架构名对不上时静默走空。
+          DEB="$(find dist/linux -maxdepth 1 -name '*.deb' -print -quit)"
+          test -n "$DEB" || { echo "dist/linux 下没有产出 .deb" >&2; exit 1; }
+          echo "产物: $DEB"
+          ACTUAL="$(dpkg-deb -f "$DEB" Version)"
+          echo "包内声明的版本: $ACTUAL / 期望: $VERSION"
+          test "$ACTUAL" = "$VERSION" || { echo "版本号不一致" >&2; exit 1; }
           echo "::group::dpkg-deb -I"
           dpkg-deb -I "$DEB"
           echo "::endgroup::"
@@ -123,17 +133,27 @@ jobs:
           dpkg-deb -c "$DEB"
           echo "::endgroup::"
           echo "::group::动态库依赖检查"
-          mkdir -p /tmp/check && dpkg-deb -x "$DEB" /tmp/check
+          rm -rf /tmp/check && mkdir -p /tmp/check
+          dpkg-deb -x "$DEB" /tmp/check
+          MISSING=0
           for bin in codex-plus-plus codex-plus-plus-manager; do
             echo "[$bin]"
-            ldd "/tmp/check/usr/bin/$bin" 2>&1 | grep -i 'not found' && exit 1 || echo "  OK: 无缺失依赖"
+            if ldd "/tmp/check/usr/bin/$bin" 2>&1 | grep -i 'not found'; then
+              MISSING=1
+            else
+              echo "  OK: 无缺失依赖"
+            fi
           done
           echo "::endgroup::"
+          test "$MISSING" -eq 0 || { echo "存在缺失的动态库依赖" >&2; exit 1; }
+          # 把产物路径交给下一步上传
+          echo "deb_path=$DEB" >> "$GITHUB_OUTPUT"
+        id: verify
 
       - name: 上传 .deb
         uses: actions/upload-artifact@v4
         with:
           name: codex-plus-plus-deb-ubuntu2404-${{ steps.ver.outputs.version }}
-          path: dist/linux/*.deb
+          path: ${{ steps.verify.outputs.deb_path }}
           retention-days: 30
           if-no-files-found: error
