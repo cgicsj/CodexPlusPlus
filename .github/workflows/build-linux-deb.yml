@@ -1,0 +1,121 @@
+name: Build Ubuntu 24.04 .deb
+
+# 官方 release 只发 Windows NSIS 与 macOS DMG，CI 里没有 Linux job。
+# 这个工作流用仓库自带的 scripts/installer/linux/build-deb.sh 补上 deb 产物。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "包版本号；留空则读取 Cargo.toml 的 workspace 版本"
+        required: false
+        default: ""
+  push:
+    branches:
+      - build-linux-deb
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Depends 里用的是 noble 专有的 *-t64 包名，构建也必须在 24.04 上做，
+      # 否则会链到与目标机不一致的 glibc / webkit2gtk ABI。
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl git pkg-config \
+            libssl-dev libsqlite3-dev libdbus-1-dev libglib2.0-dev \
+            libgtk-3-dev libayatana-appindicator3-dev \
+            libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libz3-dev libasound2-dev dpkg-dev
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # 必须显式升到 stable：edition 2024 需要 rustc >= 1.85，
+      # 而 runner 镜像预装的 rustup 版本可能偏旧，且 build-deb.sh 里的
+      # install_rust 会因为 cargo 已存在而直接跳过。
+      - name: 安装 Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version && cargo --version
+
+      - name: 缓存 cargo 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: 确定版本号
+        id: ver
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ]; then
+            V="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          test -n "$V" || { echo "无法确定版本号" >&2; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "本次打包版本: $V"
+
+      # 上游 build-deb.sh 的 build_frontend 依赖 pnpm，而仓库锁文件是
+      # package-lock.json（npm）。这里按仓库 README / release-assets.yml 的
+      # 既有做法改用 npm ci，避免 pnpm 无锁文件时解析出新版本依赖导致构建漂移。
+      - name: 构建前端
+        working-directory: apps/codex-plus-manager
+        run: |
+          npm ci --no-audit --no-fund
+          node_modules/.bin/vite build
+
+      - name: 构建 Rust 二进制并打包 .deb
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 复用上游打包脚本，但剥掉会自动执行全流程的 main 调用，
+          # 只调用 build_rust 与 package_deb（前端已在上一步用 npm 构建完）。
+          # 副本留在原目录，脚本靠 BASH_SOURCE 反推 REPO_DIR 才不会算错。
+          LIB="scripts/installer/linux/_build-deb-lib.sh"
+          sed '/^main "\$@"$/d' scripts/installer/linux/build-deb.sh > "$LIB"
+          # shellcheck disable=SC1090
+          source "$LIB"
+          build_rust
+          package_deb
+
+      - name: 校验产物
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          DEB="dist/linux/codex-plus-plus_${VERSION}_$(dpkg --print-architecture).deb"
+          ls -lh "$DEB"
+          echo "::group::dpkg-deb -I"
+          dpkg-deb -I "$DEB"
+          echo "::endgroup::"
+          echo "::group::包内文件清单"
+          dpkg-deb -c "$DEB"
+          echo "::endgroup::"
+          echo "::group::动态库依赖检查"
+          mkdir -p /tmp/check && dpkg-deb -x "$DEB" /tmp/check
+          for bin in codex-plus-plus codex-plus-plus-manager; do
+            echo "[$bin]"
+            ldd "/tmp/check/usr/bin/$bin" 2>&1 | grep -i 'not found' && exit 1 || echo "  OK: 无缺失依赖"
+          done
+          echo "::endgroup::"
+
+      - name: 上传 .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-plus-plus-deb-ubuntu2404-${{ steps.ver.outputs.version }}
+          path: dist/linux/*.deb
+          retention-days: 30
+          if-no-files-found: error
