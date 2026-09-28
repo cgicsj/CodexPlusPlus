@@ -84,8 +84,26 @@ jobs:
           # 复用上游打包脚本，但剥掉会自动执行全流程的 main 调用，
           # 只调用 build_rust 与 package_deb（前端已在上一步用 npm 构建完）。
           # 副本留在原目录，脚本靠 BASH_SOURCE 反推 REPO_DIR 才不会算错。
+          #
+          # 顺带修掉上游 build-deb.sh 的两个真实缺陷：
+          #  1) 生成的 DEBIAN/control 里，Depends 与 Recommends 之间多了一个空行。
+          #     deb 的 control 文件用空行分隔段落，dpkg-deb 会把 Recommends 与
+          #     Description 当成第二个包声明，报
+          #     "several package info entries found, only one allowed"，
+          #     同时首段被判缺 Description —— 打包必然失败。
+          #     这正是该脚本从未接进 CI、没人真跑过的证据。
+          #  2) Installed-Size 硬编码成 70620，而它上面已经算出 $installed_size 却没用上。
+          # 两处修补都写成幂等的：上游若自己修好，这里匹配不上就原样透传。
           LIB="scripts/installer/linux/_build-deb-lib.sh"
-          sed '/^main "\$@"$/d' scripts/installer/linux/build-deb.sh > "$LIB"
+          awk '{ if ($0 == "" && prev ~ /^Depends:/) { prev = $0; next } print; prev = $0 }' \
+            scripts/installer/linux/build-deb.sh \
+          | sed -e '/^main "\$@"$/d' \
+                -e 's|^Installed-Size: 70620$|Installed-Size: ${installed_size}|' \
+          > "$LIB"
+          grep -q '^Depends:' "$LIB" || { echo "补丁后找不到 Depends 字段，上游脚本可能已改结构" >&2; exit 1; }
+          # 断言 control 的 Depends 段落后面紧跟的是 Recommends，而不是空行。
+          grep -A1 '^Depends:' "$LIB" | sed -n '2p' | grep -q '^Recommends:' \
+            || { echo "control 的 Depends 后面不是 Recommends（补丁未生效或上游已改结构）" >&2; exit 1; }
           # shellcheck disable=SC1090
           source "$LIB"
           build_rust
